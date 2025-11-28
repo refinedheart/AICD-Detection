@@ -243,7 +243,6 @@ def train(hyp, opt, device, callbacks):
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
 
-
     model.anchors = de_parallel(model).model[-1].anchors
     # Distill Setting
     distill_enable = bool(opt.distill)  # 若 --distill 有值（教师模型路径），则开启蒸馏
@@ -253,18 +252,17 @@ def train(hyp, opt, device, callbacks):
         teacher_model_path = opt.distill
         if not os.path.exists(teacher_model_path):
             raise FileNotFoundError(f"Teacher model not found: {teacher_model_path}")
-        
+
         # 加载教师模型（YOLOv5l），使用 YOLOv5 原生加载函数（兼容 .pt 权重）
         LOGGER.info(f"[Distillation] Enabling knowledge distillation with teacher model: {teacher_model_path}")
         teacher_model = attempt_load(teacher_model_path, device=device)  # 加载教师模型
         teacher_model.eval()  # 切换到评估模式（禁用 Dropout/BatchNorm 训练模式）
-        
+
         # 冻结教师模型所有参数（核心：避免教师模型被训练更新）
         for param in teacher_model.parameters():
             param.requires_grad = False
         LOGGER.info("[Distillation] Teacher model loaded and frozen successfully")
 
-        
         # 验证教师模型与学生模型的兼容性（类别数、锚点必须一致，否则蒸馏无意义）
         # 从教师模型中提取关键参数（兼容 YOLOv5 模型结构）
         teacher_model_de_parallel = de_parallel(teacher_model)
@@ -273,32 +271,36 @@ def train(hyp, opt, device, callbacks):
         try:
             # YOLOv5 的 Detect 层通常是模型的最后一个子模块
             teacher_detect_module = teacher_model_de_parallel.model[-1]
-            
+
             # 安全获取类别数
-            teacher_nc = teacher_detect_module.nc if hasattr(teacher_detect_module, 'nc') else nc
-                
+            teacher_nc = teacher_detect_module.nc if hasattr(teacher_detect_module, "nc") else nc
+
             # 安全获取锚点
             teacher_anchors = teacher_detect_module.anchors
-            
+
             # if not hasattr(teacher_detect_module, 'anchors'):
             #     LOGGER.warning("[Distillation] Teacher model Detect layer lacks 'anchors' attribute. Using student anchors as fallback.")
-                
+
         except Exception as e:
             # 异常处理：如果索引或属性获取失败，则回退到学生模型的设置
-            LOGGER.warning(f"[Distillation] Failed to find Detect layer info in teacher model: {e}. Falling back to student settings.")
+            LOGGER.warning(
+                f"[Distillation] Failed to find Detect layer info in teacher model: {e}. Falling back to student settings."
+            )
             teacher_nc = nc
             teacher_anchors = None
-        
+
         # 兼容性校验
         assert teacher_nc == nc, f"[Distillation] Teacher model class count ({teacher_nc}) != Student model ({nc})"
-        
+
         # 【修改关键行】：如果 teacher_anchors 为 None，则使用学生模型的 model.anchors (它现在已经赋值了)
         if teacher_anchors is None:
-             teacher_anchors = model.anchors
-             
+            teacher_anchors = model.anchors
+
         # 兼容性校验：现在 model.anchors 已经有值了，可以直接使用
         if teacher_anchors is not None and model.anchors is not None:
-             assert torch.allclose(teacher_anchors, model.anchors), "[Distillation] Teacher and student anchors do not match"
+            assert torch.allclose(teacher_anchors, model.anchors), (
+                "[Distillation] Teacher and student anchors do not match"
+            )
     else:
         LOGGER.info("[Distillation] Disabled (use --distill teacher_model.pt to enable)")
 
@@ -416,11 +418,7 @@ def train(hyp, opt, device, callbacks):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(
-        model = model,
-        teacher_model = teacher_model,
-        autobalance=False
-    )  # init loss class
+    compute_loss = ComputeLoss(model=model, teacher_model=teacher_model, autobalance=False)  # init loss class
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\n"
@@ -613,7 +611,6 @@ def parse_opt(known=False):
     Args:
         known (bool, optional): If True, parses known arguments, ignoring the unknown. Defaults to False.
 
-        
     Returns:
         (argparse.Namespace): Parsed command-line arguments containing options for YOLOv5 execution.
 
@@ -681,10 +678,10 @@ def parse_opt(known=False):
 
     # Distill opt
     parser.add_argument(
-        "--distill", 
-        type=str, 
+        "--distill",
+        type=str,
         default="",  # 默认空字符串 → 关闭蒸馏
-        help="Enable knowledge distillation (specify teacher model path): --distill yolov5l.pt (empty=disable)"
+        help="Enable knowledge distillation (specify teacher model path): --distill yolov5l.pt (empty=disable)",
     )
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
