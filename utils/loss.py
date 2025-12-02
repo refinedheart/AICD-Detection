@@ -152,11 +152,11 @@ class ComputeLoss:
             self.teacher_model.eval()
             de_parallel(self.teacher_model).model[-1].train()
             # 2. 蒸馏超参数（从 hyp 读取，方便调优）
-            self.distill_w = h.get("distill_w", 0.6)  # 蒸馏总权重（v5s→v5l 建议 0.5~0.7，教师强则权重可大）
-            self.distill_temp = h.get("distill_temp", 1.5)  # 分类蒸馏温度（1.0~2.0，平滑软标签）
-            self.distill_box_w = h.get("distill_box_w", 1.0)  # 框蒸馏权重
-            self.distill_cls_w = h.get("distill_cls_w", 1.0)  # 分类蒸馏权重
-            self.distill_obj_w = h.get("distill_obj_w", 0.5)  # 置信度蒸馏权重（背景占比高，权重可小）
+            self.distill_w = h.get("distill_w", 0.006)  # 蒸馏总权重（v5s→v5l 建议 0.5~0.7，教师强则权重可大）
+            self.distill_temp = h.get("distill_temp", 1.5 - 1)  # 分类蒸馏温度（1.0~2.0，平滑软标签）
+            self.distill_box_w = h.get("distill_box_w", 1.0 - 0.8)  # 框蒸馏权重
+            self.distill_cls_w = h.get("distill_cls_w", 1.0 - 0.8)  # 分类蒸馏权重
+            self.distill_obj_w = h.get("distill_obj_w", 0.05)  # 置信度蒸馏权重（背景占比高，权重可小）
 
             # 3. 输出蒸馏损失函数（适配 YOLOv5 多任务）
             self.distill_cls_criterion = nn.KLDivLoss(reduction="mean")  # 分类：KL散度（软标签）
