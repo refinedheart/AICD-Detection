@@ -89,8 +89,8 @@ class Loggers:
         self.keys = [
             "train/box_loss",
             "train/obj_loss",
-            "train/cls_loss", 
-            'train/distill', # train loss
+            "train/cls_loss",
+            "train/distill",  # train loss
             "metrics/precision",
             "metrics/recall",
             "metrics/mAP_0.5",
