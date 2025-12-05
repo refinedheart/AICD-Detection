@@ -152,20 +152,24 @@ class ComputeLoss:
             self.teacher_model.eval()
             de_parallel(self.teacher_model).model[-1].train()
             # 2. 蒸馏超参数（从 hyp 读取，方便调优）
-            self.distill_w = h.get("distill_w", 0.006)  # 蒸馏总权重（v5s→v5l 建议 0.5~0.7，教师强则权重可大）
-            self.distill_temp = h.get("distill_temp", 1.5 - 1)  # 分类蒸馏温度（1.0~2.0，平滑软标签）
-            self.distill_box_w = h.get("distill_box_w", 1.0 - 0.8)  # 框蒸馏权重
-            self.distill_cls_w = h.get("distill_cls_w", 1.0 - 0.8)  # 分类蒸馏权重
-            self.distill_obj_w = h.get("distill_obj_w", 0.05)  # 置信度蒸馏权重（背景占比高，权重可小）
+            # 1. 稍微提高总开关权重，让蒸馏起效
+            self.distill_w = h.get("distill_w", 1.0) 
+            # 2. 温度稍微调高一点点，使软标签更平滑
+            self.distill_temp = h.get("distill_temp", 3.0) 
 
-            # 3. 输出蒸馏损失函数（适配 YOLOv5 多任务）
-            self.distill_cls_criterion = nn.KLDivLoss(reduction="mean")  # 分类：KL散度（软标签）
-            self.distill_box_criterion = nn.MSELoss(reduction="mean")    # 框回归：MSE（对齐精准位置）
-            self.distill_obj_criterion = nn.MSELoss(reduction="mean")    # 置信度：MSE（对齐前景/背景判断）
+            self.distill_box_w = 0.05  # 降低框权重
+            self.distill_cls_w = 0.5   # 提高分类权重
+            self.distill_obj_w = 1.0   # 提高置信度权重
+
+            self.distill_cls_criterion = nn.KLDivLoss(reduction="batchmean") # 推荐用 batchmean
+            self.distill_box_criterion = nn.MSELoss(reduction="mean")
+            # [重要修改] 置信度改用 BCE，梯度更健康
+            self.distill_obj_criterion = nn.BCEWithLogitsLoss(reduction="mean")
 
             # 4. 中间层特征蒸馏（可选，v5s→v5l 推荐开启，提升小模型特征提取能力）
             self.feat_distill_enabled = h.get("feat_distill_enabled", True)
-            self.feat_distill_w = h.get("feat_distill_w", 0.3)  # 中间特征蒸馏权重（0.2~0.4，避免覆盖任务损失）
+            # [重要修改] 特征蒸馏权重降级，防止淹没主损失！
+            self.feat_distill_w = 0.005
             # YOLOv5 中间特征层：取 Detect 头前的 3 个多尺度特征层（P3、P4、P5，对应 model.model[17]、[20]、[23]，需根据 yaml 确认）
             self.student_feat_layers = [6, 8, 10]  # 学生模型的特征层索引（yolov5s.yaml 对应 C3 输出）
             self.teacher_feat_layers = [6, 8, 10]  # 教师模型的特征层索引（yolov5l.yaml 同架构，索引一致）
@@ -308,7 +312,7 @@ class ComputeLoss:
 
                 # 3.4 置信度蒸馏（对齐 sigmoid 后的概率）
                 distill_obj_loss = self.distill_obj_criterion(
-                    torch.sigmoid(s_obj), torch.sigmoid(t_obj)
+                    s_obj, torch.sigmoid(t_obj)
                 ) * self.distill_obj_w
 
                 # 3.5 累加该层输出蒸馏损失

@@ -243,8 +243,9 @@ def train(hyp, opt, device, callbacks):
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
 
-
     model.anchors = de_parallel(model).model[-1].anchors
+    model.hyp = hyp
+
     # Distill Setting
     distill_enable = bool(opt.distill)  # 若 --distill 有值（教师模型路径），则开启蒸馏
     teacher_model = None
@@ -301,12 +302,68 @@ def train(hyp, opt, device, callbacks):
              assert torch.allclose(teacher_anchors, model.anchors), "[Distillation] Teacher and student anchors do not match"
     else:
         LOGGER.info("[Distillation] Disabled (use --distill teacher_model.pt to enable)")
+    
+
+    
+    compute_loss = ComputeLoss(model, autobalance=False, teacher_model=teacher_model)
 
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
+
+    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    
+    # 1. 模型参数
+    for k, v in model.named_modules():
+        if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
+            pg2.append(v.bias)  # biases
+        if isinstance(v, nn.BatchNorm2d):
+            pg0.append(v.weight)  # no decay
+        elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
+            pg1.append(v.weight)  # apply decay
+            
+    # 2. [关键] 将 compute_loss 中的投影层参数加入优化器
+    # 因为上面已经执行了 compute_loss = ComputeLoss(...)，所以这里不会报错了
+    if hasattr(compute_loss, "feat_projectors"):
+        LOGGER.info(f"[Distill] Adding feature projectors to optimizer")
+        for v in compute_loss.feat_projectors.modules():
+            if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
+                pg2.append(v.bias)
+            if isinstance(v, nn.BatchNorm2d):
+                pg0.append(v.weight)
+            elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
+                pg1.append(v.weight)
+
+    # 创建优化器
     optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    # 此时 smart_optimizer 内部可能只加了 model.parameters() (取决于具体实现)，
+    # 但我们手动构建了 pg0, pg1, pg2，所以通常建议手动创建 optimizer 如下：
+    
+    # 如果 smart_optimizer 不支持传入 param_groups，建议直接使用 torch.optim
+    if opt.optimizer == "Adam":
+        optimizer = torch.optim.Adam(pg0, lr=hyp["lr0"], betas=(hyp["momentum"], 0.999))
+    elif opt.optimizer == "AdamW":
+        optimizer = torch.optim.AdamW(pg0, lr=hyp["lr0"], betas=(hyp["momentum"], 0.999))
+    else:
+        optimizer = torch.optim.SGD(pg0, lr=hyp["lr0"], momentum=hyp["momentum"], nesterov=True)
+
+    optimizer.add_param_group({"params": pg1, "weight_decay": hyp["weight_decay"]})
+    optimizer.add_param_group({"params": pg2})
+    LOGGER.info(f"Optimizer groups: {len(pg2)} .bias, {len(pg0)} no decay, {len(pg1)} decay")
+    del pg0, pg1, pg2
+
+
+    # optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    # if hasattr(compute_loss, "feat_projectors"):
+    #     LOGGER.info(f"[Distill] Adding {len(compute_loss.feat_projectors)} feature projectors to optimizer")
+    #     for projector in compute_loss.feat_projectors:
+    #         # 将 projector 的参数组添加到优化器中
+    #         optimizer.add_param_group({
+    #             'params': projector.parameters(),
+    #             'lr': hyp['lr0'], 
+    #             'weight_decay': hyp['weight_decay']
+    #         })
 
     # Scheduler
     if opt.cos_lr:
@@ -416,11 +473,11 @@ def train(hyp, opt, device, callbacks):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(
-        model = model,
-        teacher_model = teacher_model,
-        autobalance=False
-    )  # init loss class
+    # compute_loss = ComputeLoss(
+    #     model = model,
+    #     teacher_model = teacher_model,
+    #     autobalance=False
+    # )  # init loss class
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\n"
