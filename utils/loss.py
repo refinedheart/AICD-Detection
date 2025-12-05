@@ -330,16 +330,23 @@ class ComputeLoss:
 
             # 4. 中间层特征蒸馏（对齐学生与教师的特征分布）
             if self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
-                # 获取学生中间层特征
-                student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs, self.student_feat_layers)
+                # [新增] 检查学生模型数据类型，确保输入图片类型匹配
+                # 验证时 imgs 是 FP16，但 self.model 是 FP32，需要转换
+                student_model = de_parallel(self.model)
+                s_imgs = imgs
+                student_dtype = next(student_model.parameters()).dtype
+                if imgs.dtype != student_dtype:
+                    s_imgs = imgs.to(student_dtype)
+
+                # 获取学生中间层特征 (使用转换后的 s_imgs)
+                student_feats = self._get_intermediate_feats(student_model, s_imgs, self.student_feat_layers)
+                
                 # 逐特征层计算蒸馏损失（MSE 对齐特征图）
                 for idx, (s_feat, t_feat, projector) in enumerate(zip(student_feats, teacher_feats, self.feat_projectors)):
-                    # 教师特征降维（v5l 256→v5s 128，512→256，1024→512）
                     t_feat_proj = projector(t_feat)
-                    # 特征图尺寸对齐（若有微小差异，用插值）
                     if s_feat.shape[2:] != t_feat_proj.shape[2:]:
                         t_feat_proj = F.interpolate(t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False)
-                    # 累加特征蒸馏损失（MSE 对齐特征分布）
+                    # 累加特征蒸馏损失
                     lfeat_distill += F.mse_loss(s_feat, t_feat_proj)
 
         if self.autobalance:
