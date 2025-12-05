@@ -337,12 +337,10 @@ class ComputeLoss:
 
                 # 逐特征层计算蒸馏损失（MSE 对齐特征图）
                 for idx, (s_feat, t_feat, projector) in enumerate(zip(student_feats, teacher_feats, self.feat_projectors)):
-                    # 教师特征降维（v5l 256→v5s 128，512→256，1024→512）
                     t_feat_proj = projector(t_feat)
-                    # 特征图尺寸对齐（若有微小差异，用插值）
                     if s_feat.shape[2:] != t_feat_proj.shape[2:]:
                         t_feat_proj = F.interpolate(t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False)
-                    # 累加特征蒸馏损失（MSE 对齐特征分布）
+                    # 累加特征蒸馏损失
                     lfeat_distill += F.mse_loss(s_feat, t_feat_proj)
 
         if self.autobalance:
