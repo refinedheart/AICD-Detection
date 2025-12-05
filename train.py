@@ -618,7 +618,7 @@ def train(hyp, opt, device, callbacks):
             stop = stopper(epoch=epoch, fitness=fi)  # early stop check
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss[:3]) + list(results) + lr
+            log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
             # Save model
