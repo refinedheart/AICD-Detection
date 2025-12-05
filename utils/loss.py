@@ -274,9 +274,19 @@ class ComputeLoss:
         # distill loss
         if self.distill_ok and imgs is not None:
             with torch.no_grad():
-                teacher_p = self.teacher_model(imgs)
+                # [新增] 检查教师模型的数据类型，并将输入图片转换为对应类型
+                # val.py 传进来的 imgs 可能是 FP16，但 Teacher 是 FP32，需要转换
+                t_imgs = imgs
+                teacher_dtype = next(self.teacher_model.parameters()).dtype
+                if imgs.dtype != teacher_dtype:
+                    t_imgs = imgs.to(teacher_dtype)
+
+                # 使用转换后的 t_imgs 输入给教师模型
+                teacher_p = self.teacher_model(t_imgs)
+                
                 if self.feat_distill_enabled:
-                    teacher_feats = self._get_intermediate_feats(self.teacher_model, imgs, self.teacher_feat_layers)
+                    # 这里也要用 t_imgs
+                    teacher_feats = self._get_intermediate_feats(self.teacher_model, t_imgs, self.teacher_feat_layers)
             for i, (student_pi, teacher_pi) in enumerate(zip(p, teacher_p)):
                 
                 b, a, gj, gi = indices[i]
