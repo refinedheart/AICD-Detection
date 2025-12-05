@@ -24,6 +24,9 @@ import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+# Add TensorBoard support
+from torch.utils.tensorboard import SummaryWriter
+
 
 try:
     import comet_ml  # must be imported before torch (if installed)
@@ -152,6 +155,9 @@ def train(hyp, opt, device, callbacks):
         opt.freeze,
     )
     callbacks.run("on_pretrain_routine_start")
+    
+    # Initialize tensorboard writer
+    writer = SummaryWriter(str(save_dir / "tensorboard"))
 
     # Directories
     w = save_dir / "weights"  # weights dir
@@ -532,9 +538,25 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.cuda.amp.autocast(amp):
+            with torch.amp.autocast('cuda', enabled=amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device), imgs=imgs)  # loss scaled by batch_size
+                # loss_items = (lbox, lobj, lcls, ldistill)
+                if loss_items.numel() == 4:
+                    lbox, lobj, lcls, ldistill = loss_items
+                else:
+                    lbox, lobj, lcls = loss_items
+                    ldistill = torch.tensor(0.0, device=loss.device)
+
+                global_step = ni  # 当前 batch 累计编号
+
+                # 写 TensorBoard
+                writer.add_scalar("loss/box", lbox.item(), global_step)
+                writer.add_scalar("loss/obj", lobj.item(), global_step)
+                writer.add_scalar("loss/cls", lcls.item(), global_step)
+                writer.add_scalar("loss/distill", (ldistill / batch_size).item(), global_step)
+                writer.add_scalar("loss/total", loss.item(), global_step)
+
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -596,7 +618,7 @@ def train(hyp, opt, device, callbacks):
             stop = stopper(epoch=epoch, fitness=fi)  # early stop check
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
+            log_vals = list(mloss[:3]) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
             # Save model
@@ -661,6 +683,10 @@ def train(hyp, opt, device, callbacks):
         callbacks.run("on_train_end", last, best, epoch, results)
 
     torch.cuda.empty_cache()
+    
+    # close tensorboard writer
+    writer.close()
+    
     return results
 
 

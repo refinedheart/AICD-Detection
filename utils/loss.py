@@ -144,6 +144,7 @@ class ComputeLoss:
         self.device = device
 
         self.teacher_model = teacher_model
+        self.teacher_model.float()     # 强制 teacher 用 FP32
         self.distill_ok = self.teacher_model is not None
         if self.distill_ok:
             # 1. freezs teacher model
@@ -270,23 +271,21 @@ class ComputeLoss:
             lobj += obji * self.balance[i]  # obj loss
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
+                # distill loss（只在训练阶段做；验证阶段直接跳过）
+        if self.distill_ok and imgs is not None and self.model.training:
+            # 确保输入给 teacher 的是 FP32
+            imgs_fp32 = imgs.float()
 
-        # distill loss
-        if self.distill_ok and imgs is not None:
             with torch.no_grad():
-                # [新增] 检查教师模型的数据类型，并将输入图片转换为对应类型
-                # val.py 传进来的 imgs 可能是 FP16，但 Teacher 是 FP32，需要转换
-                t_imgs = imgs
-                teacher_dtype = next(self.teacher_model.parameters()).dtype
-                if imgs.dtype != teacher_dtype:
-                    t_imgs = imgs.to(teacher_dtype)
+                # teacher forward 固定 FP32，并显式关掉 autocast
+                with torch.amp.autocast('cuda', enabled=False):
+                    teacher_p = self.teacher_model(imgs_fp32)
 
-                # 使用转换后的 t_imgs 输入给教师模型
-                teacher_p = self.teacher_model(t_imgs)
-                
-                if self.feat_distill_enabled:
-                    # 这里也要用 t_imgs
-                    teacher_feats = self._get_intermediate_feats(self.teacher_model, t_imgs, self.teacher_feat_layers)
+                    # 教师中间特征（同样在 FP32 下）
+                    if self.feat_distill_enabled:
+                        teacher_feats = self._get_intermediate_feats(
+                            self.teacher_model, imgs_fp32, self.teacher_feat_layers
+                        )
             for i, (student_pi, teacher_pi) in enumerate(zip(p, teacher_p)):
                 
                 b, a, gj, gi = indices[i]
@@ -329,18 +328,13 @@ class ComputeLoss:
                 ldistill += (distill_box_loss + distill_cls_loss + distill_obj_loss) / 3  # 平均三项
 
             # 4. 中间层特征蒸馏（对齐学生与教师的特征分布）
-            if self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
-                # [新增] 检查学生模型数据类型，确保输入图片类型匹配
-                # 验证时 imgs 是 FP16，但 self.model 是 FP32，需要转换
-                student_model = de_parallel(self.model)
-                s_imgs = imgs
-                student_dtype = next(student_model.parameters()).dtype
-                if imgs.dtype != student_dtype:
-                    s_imgs = imgs.to(student_dtype)
+            # if self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
+                # 获取学生中间层特征
+            #     student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs, self.student_feat_layers)
+            # 只在训练阶段做特征蒸馏（val/test 禁用）
+            if self.model.training and self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
+                student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs_fp32, self.student_feat_layers)
 
-                # 获取学生中间层特征 (使用转换后的 s_imgs)
-                student_feats = self._get_intermediate_feats(student_model, s_imgs, self.student_feat_layers)
-                
                 # 逐特征层计算蒸馏损失（MSE 对齐特征图）
                 for idx, (s_feat, t_feat, projector) in enumerate(zip(student_feats, teacher_feats, self.feat_projectors)):
                     t_feat_proj = projector(t_feat)
