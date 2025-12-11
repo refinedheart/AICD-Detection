@@ -169,6 +169,9 @@ class ComputeLoss:
 
             # 4. 中间层特征蒸馏（可选，v5s→v5l 推荐开启，提升小模型特征提取能力）
             self.feat_distill_enabled = h.get("feat_distill_enabled", True)
+
+            self.distill_block_size = h.get("distill_block_size", 4) 
+            self.distill_topk_ratio = h.get("distill_topk_ratio", 0.3)
             # [重要修改] 特征蒸馏权重降级，防止淹没主损失！
             self.feat_distill_w = 0.005
             # YOLOv5 中间特征层：取 Detect 头前的 3 个多尺度特征层（P3、P4、P5，对应 model.model[17]、[20]、[23]，需根据 yaml 确认）
@@ -190,6 +193,70 @@ class ComputeLoss:
             # 3. 传入计算好的通道数
             self.feat_projectors = self._build_feat_projectors(student_channels, teacher_channels)
 
+    def _compute_topk_patch_loss(self, s_feat, t_feat):
+        """
+        计算 Top-K Patch 蒸馏损失
+        1. 计算像素级 MSE (B, C, H, W)
+        2. 将 H, W 划分为若干个 block_size * block_size 的块
+        3. 计算每个块的总误差能量
+        4. 选取 Top-K 个误差最大的块，仅计算这些块的 Loss
+        """
+        # 1. 计算逐像素的平方差 (B, C, H, W) -> (B, H, W) [在通道维度求和]
+        diff = (s_feat - t_feat) ** 2
+        diff_spatial = diff.sum(dim=1)  # (B, H, W) 
+        
+        B, H, W = diff_spatial.shape
+        bs = self.distill_block_size
+        
+        # 如果特征图太小，无法切分，则退化为普通 MSE
+        if H < bs or W < bs:
+            return F.mse_loss(s_feat, t_feat)
+
+        # 2. 利用 AvgPool 计算每个 Block 的平均误差能量
+        # 输出形状: (B, H//bs, W//bs)
+        block_energy = F.avg_pool2d(diff_spatial, kernel_size=bs, stride=bs, count_include_pad=False)
+        
+        b_h, b_w = block_energy.shape[1], block_energy.shape[2]
+        num_blocks = b_h * b_w
+        k = int(num_blocks * self.distill_topk_ratio)
+        
+        if k == 0: # 保护机制
+            return torch.tensor(0.0, device=self.device)
+
+        # 3. 展平并选取 Top-K
+        # (B, num_blocks)
+        flat_energy = block_energy.view(B, -1)
+        
+        # 获取 Top-k 的值和索引 (我们只需要索引来生成掩码，或者直接利用值)
+        # vals: (B, k), indices: (B, k)
+        topk_vals, topk_indices = torch.topk(flat_energy, k, dim=1)
+        
+        # 4. 生成 Mask (掩码)
+        mask_flat = torch.zeros_like(flat_energy)
+        # 将 top-k 的位置置为 1
+        mask_flat.scatter_(1, topk_indices, 1.0)
+        
+        # 还原 Mask 形状 -> (B, 1, b_h, b_w) -> 上采样回 (B, 1, H, W)
+        mask = mask_flat.view(B, 1, b_h, b_w)
+        
+        # 使用最近邻插值将 Mask 放大回原特征图大小，这样被选中的 Block 区域全是 1，其余是 0
+        mask_expanded = F.interpolate(mask, size=(H, W), mode='nearest')
+        
+        # 5. 计算最终 Loss
+        # 只计算 mask 为 1 的区域的 loss。
+        # 注意：diff 已经是平方差了。
+        # 为了数值稳定性，除以有效元素的个数 (mask.sum() * C) 或者直接取 mean
+        
+        # 这里的 diff 是 (B, C, H, W)，mask_expanded 是 (B, 1, H, W)，广播机制生效
+        masked_diff = diff * mask_expanded
+        
+        # 计算非零元素的平均值 (防止 k 很小时 loss 变得极小)
+        # 总有效像素数 = B * C * (k * bs * bs)
+        total_active_elements = mask_expanded.sum() * s_feat.shape[1]
+        
+        loss = masked_diff.sum() / (total_active_elements + 1e-8)
+        
+        return loss
     def _build_feat_projectors(self, s_channels, t_channels):
         """构建特征通道投影器（v5l 特征通道数 → v5s 特征通道数，因为 v5l 通道数是 v5s 的 2 倍）"""
         projectors = []
@@ -341,7 +408,8 @@ class ComputeLoss:
                     if s_feat.shape[2:] != t_feat_proj.shape[2:]:
                         t_feat_proj = F.interpolate(t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False)
                     # 累加特征蒸馏损失
-                    lfeat_distill += F.mse_loss(s_feat, t_feat_proj)
+                    # lfeat_distill += F.mse_loss(s_feat, t_feat_proj)
+                    lfeat_distill += self._compute_topk_patch_loss(s_feat, t_feat_proj)
 
         if self.autobalance:
             self.balance = [x / self.balance[self.ssi] for x in self.balance]
