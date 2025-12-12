@@ -154,13 +154,13 @@ class ComputeLoss:
             de_parallel(self.teacher_model).model[-1].train()
             # 2. 蒸馏超参数（从 hyp 读取，方便调优）
             # 1. 稍微提高总开关权重，让蒸馏起效
-            self.distill_w = h.get("distill_w", 1.0) 
+            self.distill_w = h.get("distill_w", 0.5) 
             # 2. 温度稍微调高一点点，使软标签更平滑
             self.distill_temp = h.get("distill_temp", 3.0) 
 
             self.distill_box_w = 0.05  # 降低框权重
             self.distill_cls_w = 0.5   # 提高分类权重
-            self.distill_obj_w = 1.0   # 提高置信度权重
+            self.distill_obj_w = 0.1   # 提高置信度权重
 
             self.distill_cls_criterion = nn.KLDivLoss(reduction="batchmean") # 推荐用 batchmean
             self.distill_box_criterion = nn.MSELoss(reduction="mean")
