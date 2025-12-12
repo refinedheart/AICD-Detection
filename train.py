@@ -14,6 +14,15 @@ Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
 
+# =========================
+# Section: Module Overview / 模块概览
+# =========================
+# This file implements the training entrypoint for YOLOv5 including dataset checks,
+# model creation, optional knowledge distillation support, optimizer/scheduler setup,
+# training loop, validation and optional hyperparameter evolution.
+# 本文件实现了 YOLOv5 的训练入口，包括数据集检查、模型创建、可选的知识蒸馏支持，
+# 优化器/学习率调度设置、训练循环、验证以及（可选的）超参数进化功能。
+
 import argparse
 import math
 import os
@@ -26,6 +35,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 # Add TensorBoard support
 from torch.utils.tensorboard import SummaryWriter
+# 添加 TensorBoard 支持（用于可视化训练指标）
+# 注意：保留原始注释，以上为中文翻译
 
 
 try:
@@ -46,6 +57,12 @@ ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+
+
+# =========================
+# Section: Constants & Env / 常量与环境
+# =========================
+# LOCAL_RANK/RANK/WORLD_SIZE 环境变量用于分布式训练
 
 from ultralytics.utils.patches import torch_load
 
@@ -139,6 +156,11 @@ def train(hyp, opt, device, callbacks):
     Notes:
         Models and datasets download automatically from the latest YOLOv5 release.
     """
+    # =========================
+    # Section: Train Setup / 训练设置
+    # =========================
+    # Parse frequently used run options into locals for convenience
+    # 将常用运行选项解析为局部变量以便使用
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = (
         Path(opt.save_dir),
         opt.epochs,
@@ -158,17 +180,25 @@ def train(hyp, opt, device, callbacks):
     
     # Initialize tensorboard writer
     writer = SummaryWriter(str(save_dir / "tensorboard"))
+    # 初始化 TensorBoard 写入器（用于记录训练日志）
 
     # Directories
     w = save_dir / "weights"  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / "last.pt", w / "best.pt"
 
+
+    # =========================
+    # Section: Hyperparameters & Logging / 超参数与日志
+    # =========================
+
     # Hyperparameters
     if isinstance(hyp, str):
         with open(hyp, errors="ignore") as f:
             hyp = yaml.safe_load(f)  # load hyps dict
     LOGGER.info(colorstr("hyperparameters: ") + ", ".join(f"{k}={v}" for k, v in hyp.items()))
+    # 打印超参数（hyperparameters），以上为原注释，下一行为中文翻译
+    # hyperparameters: 超参数清单
     opt.hyp = hyp.copy()  # for saving hyps to checkpoints
 
     # Save run settings
@@ -230,6 +260,8 @@ def train(hyp, opt, device, callbacks):
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
+    # AMP: 自动混合精度（自动检测并启用）
+    # 注释保留，以上为中文翻译
 
     # Freeze
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
@@ -243,6 +275,7 @@ def train(hyp, opt, device, callbacks):
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+    # 图像尺寸检查：确保 imgsz 是网格大小（gs）的整数倍
 
     # Batch size
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
@@ -253,6 +286,10 @@ def train(hyp, opt, device, callbacks):
     model.hyp = hyp
 
     # Distill Setting
+    # =========================
+    # Section: Knowledge Distillation / 知识蒸馏
+    # =========================
+    # distill_enable: 如果传入 --distill 参数则启用教师模型蒸馏
     distill_enable = bool(opt.distill)  # 若 --distill 有值（教师模型路径），则开启蒸馏
     teacher_model = None
     if distill_enable:
@@ -311,6 +348,8 @@ def train(hyp, opt, device, callbacks):
     
 
     
+    # Loss function setup
+    # compute_loss: 封装了 box/obj/cls 损失，支持传入 teacher_model 以计算蒸馏损失
     compute_loss = ComputeLoss(model, autobalance=False, teacher_model=teacher_model)
 
     # Optimizer
@@ -319,6 +358,9 @@ def train(hyp, opt, device, callbacks):
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    # pg0: 不衰减参数（例如 BatchNorm 权重）
+    # pg1: 需衰减权重
+    # pg2: 偏置参数（biases）
     
     # 1. 模型参数
     for k, v in model.named_modules():
@@ -330,7 +372,7 @@ def train(hyp, opt, device, callbacks):
             pg1.append(v.weight)  # apply decay
             
     # 2. [关键] 将 compute_loss 中的投影层参数加入优化器
-    # 因为上面已经执行了 compute_loss = ComputeLoss(...)，所以这里不会报错了
+    # 如果存在特征投影器（feat_projectors），其参数也应加入优化器以便训练
     if hasattr(compute_loss, "feat_projectors"):
         LOGGER.info(f"[Distill] Adding feature projectors to optimizer")
         for v in compute_loss.feat_projectors.modules():
@@ -346,7 +388,7 @@ def train(hyp, opt, device, callbacks):
     # 此时 smart_optimizer 内部可能只加了 model.parameters() (取决于具体实现)，
     # 但我们手动构建了 pg0, pg1, pg2，所以通常建议手动创建 optimizer 如下：
     
-    # 如果 smart_optimizer 不支持传入 param_groups，建议直接使用 torch.optim
+    # Note: 如果 smart_optimizer 不支持 param_groups，这里改用 torch.optim 手动创建
     if opt.optimizer == "Adam":
         optimizer = torch.optim.Adam(pg0, lr=hyp["lr0"], betas=(hyp["momentum"], 0.999))
     elif opt.optimizer == "AdamW":
@@ -380,10 +422,13 @@ def train(hyp, opt, device, callbacks):
             """Linear learning rate scheduler function with decay calculated by epoch proportion."""
             return (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]  # linear
 
+    # Learning rate scheduler: `lf` 返回基于 epoch 的 lr 缩放因子
+
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
     ema = ModelEMA(model) if RANK in {-1, 0} else None
+    # EMA: 指数移动平均模型，用于更稳定的评估
 
     # Resume
     best_fitness, start_epoch = 0.0, 0
@@ -449,6 +494,7 @@ def train(hyp, opt, device, callbacks):
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp["anchor_t"], imgsz=imgsz)  # run AutoAnchor
             model.half().float()  # pre-reduce anchor precision
+        # 在训练开始前，可能会运行 AutoAnchor 并进行模型精度预处理（half->float）
 
         callbacks.run("on_pretrain_routine_end", labels, names)
 
@@ -536,6 +582,7 @@ def train(hyp, opt, device, callbacks):
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+            # 多尺度训练：随机缩放输入（±50%），并保持为 gs 的倍数
 
             # Forward
             with torch.amp.autocast('cuda', enabled=amp):
@@ -561,6 +608,8 @@ def train(hyp, opt, device, callbacks):
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.0
+
+            # 反向传播与优化（含 AMP 与梯度累积）
 
             # Backward
             scaler.scale(loss).backward()
@@ -643,6 +692,8 @@ def train(hyp, opt, device, callbacks):
                     torch.save(ckpt, w / f"epoch{epoch}.pt")
                 del ckpt
                 callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
+
+                # 模型保存：保存 last/best/checkpoint，并触发回调
 
         # EarlyStopping
         if RANK != -1:  # if DDP training
