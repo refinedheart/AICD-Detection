@@ -142,12 +142,11 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
-
         self.teacher_model = teacher_model
-        self.teacher_model.float()     # 强制 teacher 用 FP32
         self.distill_ok = self.teacher_model is not None
         if self.distill_ok:
             # 1. freezs teacher model
+            self.teacher_model.float()     # 强制 teacher 用 FP32
             for param in self.teacher_model.parameters():
                 param.requires_grad = False
             self.teacher_model.eval()
