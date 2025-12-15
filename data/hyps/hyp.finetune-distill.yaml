@@ -4,6 +4,10 @@ lrf: 0.1                # 最终学习率不降太低，保持微调能力
 momentum: 0.937
 weight_decay: 0.0005    # 恢复默认正则化
 
+warmup_epochs: 1.0      # 热身轮数
+warmup_momentum: 0.8    # 热身初始动量
+warmup_bias_lr: 0.1     # 热身初始偏置学习率 (报错就是缺这个)
+
 # 蒸馏开关
 feat_distill_enabled: False  # 【关键】关闭特征蒸馏，只保留分类/回归蒸馏
 
