@@ -350,6 +350,56 @@ def train(hyp, opt, device, callbacks):
     
     # Loss function setup
     # compute_loss: 封装了 box/obj/cls 损失，支持传入 teacher_model 以计算蒸馏损失
+    # 如果启用了蒸馏，根据推荐设置注入 hyp 默认值（但不覆盖用户已指定的值）
+    if distill_enable:
+        # 全局推荐值（只在 hyp 中缺失时设置）
+        recommended = {
+            "distill_warmup_ratio": 0.3,
+            "distill_w": 0.1,
+            "distill_obj_w": 0.0,
+            "feat_distill_w": 0.005,
+            "distill_temp": 3.0,
+            "distill_block_size": 4,
+            "distill_topk_ratio": 0.3,
+            "distill_box_loss_type": "l1",
+            "distill_box_w": 0.05,
+            "distill_cls_w": 0.0,
+        }
+
+        for k, v in recommended.items():
+            hyp.setdefault(k, v)
+
+        # 根据 distill_mode 选择实验组默认值（覆盖少数安全的键）
+        mode = getattr(opt, "distill_mode", "none")
+        if mode == "A":
+            # A: 仅 box 蒸馏，保守特征与分类蒸馏
+            hyp.setdefault("distill_box_enabled", True)
+            hyp.setdefault("distill_cls_enabled", False)
+            hyp.setdefault("feat_distill_enabled", False)
+            hyp["distill_box_w"] = hyp.get("distill_box_w", 0.05)
+            hyp["distill_cls_w"] = 0.0
+            hyp["feat_distill_w"] = 0.0
+        elif mode == "B":
+            # B: box + feature 蒸馏
+            hyp.setdefault("distill_box_enabled", True)
+            hyp.setdefault("distill_cls_enabled", False)
+            hyp.setdefault("feat_distill_enabled", True)
+            hyp["distill_box_w"] = hyp.get("distill_box_w", 0.03)
+            hyp["feat_distill_w"] = hyp.get("feat_distill_w", 0.01)
+        elif mode == "C":
+            # C: 全量蒸馏（box + cls + feat），稍大温度
+            hyp.setdefault("distill_box_enabled", True)
+            hyp.setdefault("distill_cls_enabled", True)
+            hyp.setdefault("feat_distill_enabled", True)
+            hyp["distill_box_w"] = hyp.get("distill_box_w", 0.02)
+            hyp["distill_cls_w"] = hyp.get("distill_cls_w", 0.1)
+            hyp["feat_distill_w"] = hyp.get("feat_distill_w", 0.02)
+            hyp["distill_temp"] = hyp.get("distill_temp", 4.0)
+
+        # 将更新写回 model.hyp 以便 ComputeLoss 在初始化时读取到最新 hyp
+        model.hyp = hyp
+        LOGGER.info(f"[Distill] Applied recommended hyp defaults for mode={mode}: { {k: hyp[k] for k in ['distill_w','distill_warmup_ratio','distill_box_w','distill_cls_w','feat_distill_w','distill_temp']} }")
+
     compute_loss = ComputeLoss(model, autobalance=False, teacher_model=teacher_model)
 
     # Optimizer
@@ -374,7 +424,7 @@ def train(hyp, opt, device, callbacks):
     # 2. [关键] 将 compute_loss 中的投影层参数加入优化器
     # 如果存在特征投影器（feat_projectors），其参数也应加入优化器以便训练
     if hasattr(compute_loss, "feat_projectors"):
-        LOGGER.info(f"[Distill] Adding feature projectors to optimizer")
+        LOGGER.info("[Distill] Adding feature projectors to optimizer")
         for v in compute_loss.feat_projectors.modules():
             if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
                 pg2.append(v.bias)
@@ -540,6 +590,12 @@ def train(hyp, opt, device, callbacks):
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run("on_train_epoch_start")
         model.train()
+        # 更新 compute_loss 的 epoch 信息以支持蒸馏 warmup 调度
+        if hasattr(compute_loss, 'set_epoch'):
+            try:
+                compute_loss.set_epoch(epoch, epochs)
+            except Exception:
+                pass
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -603,7 +659,7 @@ def train(hyp, opt, device, callbacks):
                 writer.add_scalar("loss/cls", lcls.item(), global_step)
                 writer.add_scalar("loss/distill", (ldistill / batch_size).item(), global_step)
                 writer.add_scalar("loss/total", loss.item(), global_step)
-
+                
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -683,6 +739,31 @@ def train(hyp, opt, device, callbacks):
                     "git": GIT_INFO,  # {remote, branch, commit} if a git repo
                     "date": datetime.now().isoformat(),
                 }
+                
+                # TensorBoard: log validation metrics and losses per epoch
+                try:
+                    writer.add_scalar("metrics/precision", float(results[0]), epoch)
+                    writer.add_scalar("metrics/recall", float(results[1]), epoch)
+                    writer.add_scalar("metrics/mAP_0.5", float(results[2]), epoch)
+                    writer.add_scalar("metrics/mAP_0.5:0.95", float(results[3]), epoch)
+                    # val losses: box, obj, cls (if present)
+                    if len(results) > 4:
+                        writer.add_scalar("val/box_loss", float(results[4]), epoch)
+                    if len(results) > 5:
+                        writer.add_scalar("val/obj_loss", float(results[5]), epoch)
+                    if len(results) > 6:
+                        writer.add_scalar("val/cls_loss", float(results[6]), epoch)
+                    # training losses (mloss) are mean losses: [lbox, lobj, lcls, ldistill]
+                    writer.add_scalar("train/box_loss", float(mloss[0]), epoch)
+                    writer.add_scalar("train/obj_loss", float(mloss[1]), epoch)
+                    writer.add_scalar("train/cls_loss", float(mloss[2]), epoch)
+                    # learning rates per param group
+                    for gi, g in enumerate(optimizer.param_groups):
+                        writer.add_scalar(f"lr/group_{gi}", float(g.get("lr", 0.0)), epoch)
+                    # optional: track best fitness
+                    writer.add_scalar("metrics/best_fitness", float(best_fitness), epoch)
+                except Exception as _:
+                    LOGGER.debug("Failed to write scalars to TensorBoard")
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
@@ -819,6 +900,13 @@ def parse_opt(known=False):
         type=str, 
         default="",  # 默认空字符串 → 关闭蒸馏
         help="Enable knowledge distillation (specify teacher model path): --distill yolov5l.pt (empty=disable)"
+    )
+    parser.add_argument(
+        "--distill_mode",
+        type=str,
+        default="none",
+        choices=["none", "A", "B", "C"],
+        help="Distillation experiment mode: A=box-only, B=box+feat, C=box+cls+feat (default=none)",
     )
 
     return parser.parse_known_args()[0] if known else parser.parse_args()

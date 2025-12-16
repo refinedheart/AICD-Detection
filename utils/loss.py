@@ -153,16 +153,27 @@ class ComputeLoss:
             de_parallel(self.teacher_model).model[-1].train()
             # 2. 蒸馏超参数（从 hyp 读取，方便调优）
             # 1. 稍微提高总开关权重，让蒸馏起效
-            self.distill_w = h.get("distill_w", 0.1) 
+            self.distill_w_max = h.get("distill_w", 0.1)  # 总体蒸馏权重（最大值，由 warmup 调度器控制）
+            self.distill_warmup_ratio = h.get("distill_warmup_ratio", 0.3)  # 蒸馏 warmup 比例（训练前多少比例 epoch 为 0）
+            self.distill_w = 0.0  # 当前蒸馏权重（通过 set_epoch 更新），默认 0（warmup 初始）
             # 2. 温度稍微调高一点点，使软标签更平滑
             self.distill_temp = h.get("distill_temp", 3.0) 
 
-            self.distill_box_w = 0.05  # 降低框权重
-            self.distill_cls_w = 0.1   # 提高分类权重
-            self.distill_obj_w = 0.1   # 提高置信度权重
+            self.distill_box_w = h.get("distill_box_w", 0.05)  # 降低框权重
+            self.distill_cls_w = h.get("distill_cls_w", 0.1)   # 提高分类权重
+            self.distill_obj_w = h.get("distill_obj_w", 0.0)   # 提高置信度权重，默认关闭以保护 Recall
+
+            # 各类蒸馏子项是否启用（可通过 hyp 控制实验组 A/B/C）
+            self.distill_box_enabled = h.get("distill_box_enabled", True)
+            self.distill_cls_enabled = h.get("distill_cls_enabled", False)
+            self.distill_obj_enabled = h.get("distill_obj_enabled", False)
 
             self.distill_cls_criterion = nn.KLDivLoss(reduction="batchmean") # 推荐用 batchmean
-            self.distill_box_criterion = nn.MSELoss(reduction="mean")
+            self.distill_box_loss_type = h.get("distill_box_loss_type", "l1")  # 支持多种框蒸馏类型（L1/MSE），默认 L1 更稳定
+            if self.distill_box_loss_type == "mse":
+                self.distill_box_criterion = nn.MSELoss(reduction="mean")
+            else:
+                self.distill_box_criterion = nn.L1Loss(reduction="mean")
             # [重要修改] 置信度改用 BCE，梯度更健康
             self.distill_obj_criterion = nn.BCEWithLogitsLoss(reduction="mean")
 
@@ -176,6 +187,9 @@ class ComputeLoss:
             # YOLOv5 中间特征层：取 Detect 头前的 3 个多尺度特征层（P3、P4、P5，对应 model.model[17]、[20]、[23]，需根据 yaml 确认）
             self.student_feat_layers = [6, 8, 10]  # 学生模型的特征层索引（yolov5s.yaml 对应 C3 输出）
             self.teacher_feat_layers = [6, 8, 10]  # 教师模型的特征层索引（yolov5l.yaml 同架构，索引一致）
+            # Class-aware distillation settings
+            self.wbc_class_id = h.get("wbc_class_id", 1)   # 默认 WBC=1
+            self.wbc_distill_factor = h.get("wbc_distill_factor", 2.0)  # WBC 蒸馏增强系数
 
             dummy_img = torch.zeros(1, 3, 640, 640).to(self.device)
 
@@ -192,6 +206,29 @@ class ComputeLoss:
             # 3. 传入计算好的通道数
             self.feat_projectors = self._build_feat_projectors(student_channels, teacher_channels)
 
+        # 记录 epoch/total 用于 warmup 调度
+        self.current_epoch = 0
+        self.epochs = None
+
+    def set_epoch(self, epoch, epochs):
+        """Set current epoch and total epochs for warmup scheduling of distill weight."""
+        self.current_epoch = int(epoch)
+        self.epochs = int(epochs) if epochs is not None else None
+        # compute linear warmup scaling
+        if self.epochs is None or self.epochs <= 0:
+            self.distill_w = self.distill_w_max
+            return
+        warmup_epochs = max(int(self.epochs * float(self.distill_warmup_ratio)), 1)
+        # if within warmup period -> 0
+        if self.current_epoch < warmup_epochs:
+            self.distill_w = 0.0
+        else:
+            # linear ramp from 0 at end of warmup to distill_w_max at final epoch
+            progress = (self.current_epoch - warmup_epochs) / max(1, (self.epochs - warmup_epochs))
+            self.distill_w = float(self.distill_w_max) * float(progress)
+            # clamp
+            if self.distill_w > self.distill_w_max:
+                self.distill_w = float(self.distill_w_max)
     def _compute_topk_patch_loss(self, s_feat, t_feat):
         """
         计算 Top-K Patch 蒸馏损失
@@ -304,6 +341,13 @@ class ComputeLoss:
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
+            # -------- Class-aware weight (WBC stronger distillation) --------
+            # tcls[i]: GT class for each positive sample
+            class_weight = torch.ones_like(tcls[i], dtype=torch.float, device=self.device)
+
+            # 强化 WBC 的蒸馏权重
+            class_weight[tcls[i] == self.wbc_class_id] = self.wbc_distill_factor
+
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
 
@@ -368,39 +412,54 @@ class ComputeLoss:
                 t_pxy, t_pwh, _, t_pcls = teacher_pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
                 t_obj = teacher_pi[b, a, gj, gi, 4:5]  # 教师置信度（logits）
 
-                # 3.2 框回归蒸馏（对齐解码后的真实框位置）
-                # s_box = torch.cat([
-                #     s_pxy.sigmoid() * 2 - 0.5,
-                #     (s_pwh.sigmoid() * 2) ** 2 * anchors[i]
-                # ], 1)
-                # t_box = torch.cat([
-                #     t_pxy.sigmoid() * 2 - 0.5,
-                #     (t_pwh.sigmoid() * 2) ** 2 * anchors[i]
-                # ], 1)
-                s_box = torch.cat([
-                    s_pxy.sigmoid() * 2 - 0.5,
-                    (s_pwh.sigmoid() * 2) ** 2 
-                ], 1)
-                t_box = torch.cat([
-                    t_pxy.sigmoid() * 2 - 0.5,
-                    (t_pwh.sigmoid() * 2) ** 2 
-                ], 1)
-                distill_box_loss = self.distill_box_criterion(s_box, t_box) * self.distill_box_w
+                # 3.2 框回归蒸馏（对齐解码后的预测框位置），仅在启用且使用正样本位置计算
+                distill_box_loss = torch.tensor(0.0, device=self.device)
+                if getattr(self, 'distill_box_enabled', True):
+                    # student/teacher box are decoded; 对齐后计算 L1/MSE
+                    s_box = torch.cat([
+                        s_pxy.sigmoid() * 2 - 0.5,
+                        (s_pwh.sigmoid() * 2) ** 2 
+                    ], 1)
+                    t_box = torch.cat([
+                        t_pxy.sigmoid() * 2 - 0.5,
+                        (t_pwh.sigmoid() * 2) ** 2 
+                    ], 1)
+                    if getattr(self, 'distill_box_loss_type', 'l1') == 'mse':
+                        distill_box_loss = F.mse_loss(s_box, t_box, reduction='mean') * self.distill_box_w
+                    else:
+                        # per-sample L1 loss: (n, 4) -> (n,)
+                        per_sample_box_loss = F.l1_loss(s_box, t_box, reduction='none').mean(dim=1)
 
-                # 3.3 分类蒸馏（KL散度 + 温度平滑，适配软标签）
-                s_cls_logsoftmax = F.log_softmax(s_pcls / self.distill_temp, dim=-1)
-                t_cls_softmax = F.softmax(t_pcls / self.distill_temp, dim=-1)
-                # 乘温度平方：抵消 KL 散度在高温度下的损失缩放（参考蒸馏原论文）
-                distill_cls_loss = self.distill_cls_criterion(s_cls_logsoftmax, t_cls_softmax) * (self.distill_temp ** 2) * self.distill_cls_w
+                        # class-aware weighted distillation
+                        distill_box_loss = (per_sample_box_loss).mean() * self.distill_box_w
 
-                # 3.4 置信度蒸馏（对齐 sigmoid 后的概率）
-                distill_obj_loss = self.distill_obj_criterion(
-                    s_obj, torch.sigmoid(t_obj)
-                ) * self.distill_obj_w
 
-                # 3.5 累加该层输出蒸馏损失
-                ldistill += (distill_box_loss + distill_cls_loss + distill_obj_loss) / 3  # 平均三项
-                ldistill *= self.distill_w  # 总体蒸馏权重调整
+                # 3.3 分类蒸馏（KL散度 + 温度平滑），可配置是否启用
+                distill_cls_loss = torch.tensor(0.0, device=self.device)
+                if getattr(self, 'distill_cls_enabled', False):
+                    s_cls_logsoftmax = F.log_softmax(s_pcls / self.distill_temp, dim=-1)
+                    t_cls_softmax = F.softmax(t_pcls / self.distill_temp, dim=-1)
+                    # 乘温度平方：抵消 KL 散度在高温度下的损失缩放（参考蒸馏原论文）
+                    # per-sample KL divergence
+                    per_sample_kl = F.kl_div(
+                        s_cls_logsoftmax, 
+                        t_cls_softmax, 
+                        reduction='none'
+                    ).sum(dim=1)  # (n,)
+                    
+                    distill_cls_loss = (
+                        per_sample_kl
+                    ).mean() * (self.distill_temp ** 2) * self.distill_cls_w
+
+
+                # 3.4 置信度蒸馏（对齐 sigmoid 后的概率），默认关闭
+                distill_obj_loss = torch.tensor(0.0, device=self.device)
+                if getattr(self, 'distill_obj_enabled', False):
+                    distill_obj_loss = self.distill_obj_criterion(s_obj, torch.sigmoid(t_obj)) * self.distill_obj_w
+
+                # 3.5 累加该层输出蒸馏损失（使用总体权重 self.distill_w 来控制）
+                layer_distill = distill_box_loss + distill_cls_loss + distill_obj_loss
+                ldistill += layer_distill * getattr(self, 'distill_w', 0.0)
 
             # 4. 中间层特征蒸馏（对齐学生与教师的特征分布）
             # if self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
@@ -417,7 +476,8 @@ class ComputeLoss:
                         t_feat_proj = F.interpolate(t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False)
                     # 累加特征蒸馏损失
                     # lfeat_distill += F.mse_loss(s_feat, t_feat_proj)
-                    lfeat_distill += self._compute_topk_patch_loss(s_feat, t_feat_proj)
+                    # 将特征蒸馏权重和总体蒸馏权重同时考虑进来（feat_distill_w * distill_w）
+                    lfeat_distill += self._compute_topk_patch_loss(s_feat, t_feat_proj) * getattr(self, 'feat_distill_w', 0.0) * getattr(self, 'distill_w', 0.0)
 
         if self.autobalance:
             self.balance = [x / self.balance[self.ssi] for x in self.balance]
