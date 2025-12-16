@@ -142,24 +142,23 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
-
         self.teacher_model = teacher_model
-        self.teacher_model.float()     # 强制 teacher 用 FP32
         self.distill_ok = self.teacher_model is not None
         if self.distill_ok:
             # 1. freezs teacher model
+            self.teacher_model.float()     # 强制 teacher 用 FP32
             for param in self.teacher_model.parameters():
                 param.requires_grad = False
             self.teacher_model.eval()
             de_parallel(self.teacher_model).model[-1].train()
             # 2. 蒸馏超参数（从 hyp 读取，方便调优）
             # 1. 稍微提高总开关权重，让蒸馏起效
-            self.distill_w = h.get("distill_w", 0.5) 
+            self.distill_w = h.get("distill_w", 0.1) 
             # 2. 温度稍微调高一点点，使软标签更平滑
             self.distill_temp = h.get("distill_temp", 3.0) 
 
             self.distill_box_w = 0.05  # 降低框权重
-            self.distill_cls_w = 0.5   # 提高分类权重
+            self.distill_cls_w = 0.1   # 提高分类权重
             self.distill_obj_w = 0.1   # 提高置信度权重
 
             self.distill_cls_criterion = nn.KLDivLoss(reduction="batchmean") # 推荐用 batchmean
@@ -370,13 +369,21 @@ class ComputeLoss:
                 t_obj = teacher_pi[b, a, gj, gi, 4:5]  # 教师置信度（logits）
 
                 # 3.2 框回归蒸馏（对齐解码后的真实框位置）
+                # s_box = torch.cat([
+                #     s_pxy.sigmoid() * 2 - 0.5,
+                #     (s_pwh.sigmoid() * 2) ** 2 * anchors[i]
+                # ], 1)
+                # t_box = torch.cat([
+                #     t_pxy.sigmoid() * 2 - 0.5,
+                #     (t_pwh.sigmoid() * 2) ** 2 * anchors[i]
+                # ], 1)
                 s_box = torch.cat([
                     s_pxy.sigmoid() * 2 - 0.5,
-                    (s_pwh.sigmoid() * 2) ** 2 * anchors[i]
+                    (s_pwh.sigmoid() * 2) ** 2 
                 ], 1)
                 t_box = torch.cat([
                     t_pxy.sigmoid() * 2 - 0.5,
-                    (t_pwh.sigmoid() * 2) ** 2 * anchors[i]
+                    (t_pwh.sigmoid() * 2) ** 2 
                 ], 1)
                 distill_box_loss = self.distill_box_criterion(s_box, t_box) * self.distill_box_w
 
@@ -393,6 +400,7 @@ class ComputeLoss:
 
                 # 3.5 累加该层输出蒸馏损失
                 ldistill += (distill_box_loss + distill_cls_loss + distill_obj_loss) / 3  # 平均三项
+                ldistill *= self.distill_w  # 总体蒸馏权重调整
 
             # 4. 中间层特征蒸馏（对齐学生与教师的特征分布）
             # if self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
