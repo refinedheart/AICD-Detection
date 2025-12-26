@@ -341,12 +341,13 @@ class ComputeLoss:
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
-            # -------- Class-aware weight (WBC stronger distillation) --------
-            # tcls[i]: GT class for each positive sample
-            class_weight = torch.ones_like(tcls[i], dtype=torch.float, device=self.device)
+            if self.distill_ok is True:
+                # -------- Class-aware weight (WBC stronger distillation) --------
+                # tcls[i]: GT class for each positive sample
+                class_weight = torch.ones_like(tcls[i], dtype=torch.float, device=self.device)
 
-            # 强化 WBC 的蒸馏权重
-            class_weight[tcls[i] == self.wbc_class_id] = self.wbc_distill_factor
+                # 强化 WBC 的蒸馏权重
+                class_weight[tcls[i] == self.wbc_class_id] = self.wbc_distill_factor
 
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj

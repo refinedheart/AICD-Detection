@@ -4,7 +4,7 @@
 # Usage example: python train.py --data data/BCCD.yaml
 
 # Dataset root (relative to repository root)
-path: data/BCCD
+path: ../datasets/BCCD
 
 # Image directories (after splitting):
 train: images/train
