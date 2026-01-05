@@ -10,7 +10,7 @@ gitdb==4.0.12
 GitPython==3.1.45
 grpcio==1.76.0
 idna==3.11
-importlib_metadata==8.7.0
+importlib_metadata==8.7.1
 importlib_resources==6.5.2
 Jinja2==3.1.6
 kiwisolver==1.4.7
