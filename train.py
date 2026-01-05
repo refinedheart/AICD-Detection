@@ -33,8 +33,10 @@ import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+
 # Add TensorBoard support
 from torch.utils.tensorboard import SummaryWriter
+
 # 添加 TensorBoard 支持（用于可视化训练指标）
 # 注意：保留原始注释，以上为中文翻译
 
@@ -177,7 +179,7 @@ def train(hyp, opt, device, callbacks):
         opt.freeze,
     )
     callbacks.run("on_pretrain_routine_start")
-    
+
     # Initialize tensorboard writer
     writer = SummaryWriter(str(save_dir / "tensorboard"))
     # 初始化 TensorBoard 写入器（用于记录训练日志）
@@ -186,7 +188,6 @@ def train(hyp, opt, device, callbacks):
     w = save_dir / "weights"  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / "last.pt", w / "best.pt"
-
 
     # =========================
     # Section: Hyperparameters & Logging / 超参数与日志
@@ -297,18 +298,17 @@ def train(hyp, opt, device, callbacks):
         teacher_model_path = opt.distill
         if not os.path.exists(teacher_model_path):
             raise FileNotFoundError(f"Teacher model not found: {teacher_model_path}")
-        
+
         # 加载教师模型（YOLOv5l），使用 YOLOv5 原生加载函数（兼容 .pt 权重）
         LOGGER.info(f"[Distillation] Enabling knowledge distillation with teacher model: {teacher_model_path}")
         teacher_model = attempt_load(teacher_model_path, device=device)  # 加载教师模型
         teacher_model.eval()  # 切换到评估模式（禁用 Dropout/BatchNorm 训练模式）
-        
+
         # 冻结教师模型所有参数（核心：避免教师模型被训练更新）
         for param in teacher_model.parameters():
             param.requires_grad = False
         LOGGER.info("[Distillation] Teacher model loaded and frozen successfully")
 
-        
         # 验证教师模型与学生模型的兼容性（类别数、锚点必须一致，否则蒸馏无意义）
         # 从教师模型中提取关键参数（兼容 YOLOv5 模型结构）
         teacher_model_de_parallel = de_parallel(teacher_model)
@@ -317,37 +317,39 @@ def train(hyp, opt, device, callbacks):
         try:
             # YOLOv5 的 Detect 层通常是模型的最后一个子模块
             teacher_detect_module = teacher_model_de_parallel.model[-1]
-            
+
             # 安全获取类别数
-            teacher_nc = teacher_detect_module.nc if hasattr(teacher_detect_module, 'nc') else nc
-                
+            teacher_nc = teacher_detect_module.nc if hasattr(teacher_detect_module, "nc") else nc
+
             # 安全获取锚点
             teacher_anchors = teacher_detect_module.anchors
-            
+
             # if not hasattr(teacher_detect_module, 'anchors'):
             #     LOGGER.warning("[Distillation] Teacher model Detect layer lacks 'anchors' attribute. Using student anchors as fallback.")
-                
+
         except Exception as e:
             # 异常处理：如果索引或属性获取失败，则回退到学生模型的设置
-            LOGGER.warning(f"[Distillation] Failed to find Detect layer info in teacher model: {e}. Falling back to student settings.")
+            LOGGER.warning(
+                f"[Distillation] Failed to find Detect layer info in teacher model: {e}. Falling back to student settings."
+            )
             teacher_nc = nc
             teacher_anchors = None
-        
+
         # 兼容性校验
         assert teacher_nc == nc, f"[Distillation] Teacher model class count ({teacher_nc}) != Student model ({nc})"
-        
+
         # 【修改关键行】：如果 teacher_anchors 为 None，则使用学生模型的 model.anchors (它现在已经赋值了)
         if teacher_anchors is None:
-             teacher_anchors = model.anchors
-             
+            teacher_anchors = model.anchors
+
         # 兼容性校验：现在 model.anchors 已经有值了，可以直接使用
         if teacher_anchors is not None and model.anchors is not None:
-             assert torch.allclose(teacher_anchors, model.anchors), "[Distillation] Teacher and student anchors do not match"
+            assert torch.allclose(teacher_anchors, model.anchors), (
+                "[Distillation] Teacher and student anchors do not match"
+            )
     else:
         LOGGER.info("[Distillation] Disabled (use --distill teacher_model.pt to enable)")
-    
 
-    
     # Loss function setup
     # compute_loss: 封装了 box/obj/cls 损失，支持传入 teacher_model 以计算蒸馏损失
     # 如果启用了蒸馏，根据推荐设置注入 hyp 默认值（但不覆盖用户已指定的值）
@@ -398,7 +400,9 @@ def train(hyp, opt, device, callbacks):
 
         # 将更新写回 model.hyp 以便 ComputeLoss 在初始化时读取到最新 hyp
         model.hyp = hyp
-        LOGGER.info(f"[Distill] Applied recommended hyp defaults for mode={mode}: { {k: hyp[k] for k in ['distill_w','distill_warmup_ratio','distill_box_w','distill_cls_w','feat_distill_w','distill_temp']} }")
+        LOGGER.info(
+            f"[Distill] Applied recommended hyp defaults for mode={mode}: { {k: hyp[k] for k in ['distill_w', 'distill_warmup_ratio', 'distill_box_w', 'distill_cls_w', 'feat_distill_w', 'distill_temp']} }"
+        )
 
     compute_loss = ComputeLoss(model, autobalance=False, teacher_model=teacher_model)
 
@@ -411,7 +415,7 @@ def train(hyp, opt, device, callbacks):
     # pg0: 不衰减参数（例如 BatchNorm 权重）
     # pg1: 需衰减权重
     # pg2: 偏置参数（biases）
-    
+
     # 1. 模型参数
     for k, v in model.named_modules():
         if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
@@ -420,7 +424,7 @@ def train(hyp, opt, device, callbacks):
             pg0.append(v.weight)  # no decay
         elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
             pg1.append(v.weight)  # apply decay
-            
+
     # 2. [关键] 将 compute_loss 中的投影层参数加入优化器
     # 如果存在特征投影器（feat_projectors），其参数也应加入优化器以便训练
     if hasattr(compute_loss, "feat_projectors"):
@@ -437,7 +441,7 @@ def train(hyp, opt, device, callbacks):
     optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
     # 此时 smart_optimizer 内部可能只加了 model.parameters() (取决于具体实现)，
     # 但我们手动构建了 pg0, pg1, pg2，所以通常建议手动创建 optimizer 如下：
-    
+
     # Note: 如果 smart_optimizer 不支持 param_groups，这里改用 torch.optim 手动创建
     if opt.optimizer == "Adam":
         optimizer = torch.optim.Adam(pg0, lr=hyp["lr0"], betas=(hyp["momentum"], 0.999))
@@ -451,7 +455,6 @@ def train(hyp, opt, device, callbacks):
     LOGGER.info(f"Optimizer groups: {len(pg2)} .bias, {len(pg0)} no decay, {len(pg1)} decay")
     del pg0, pg1, pg2
 
-
     # optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
     # if hasattr(compute_loss, "feat_projectors"):
     #     LOGGER.info(f"[Distill] Adding {len(compute_loss.feat_projectors)} feature projectors to optimizer")
@@ -459,7 +462,7 @@ def train(hyp, opt, device, callbacks):
     #         # 将 projector 的参数组添加到优化器中
     #         optimizer.add_param_group({
     #             'params': projector.parameters(),
-    #             'lr': hyp['lr0'], 
+    #             'lr': hyp['lr0'],
     #             'weight_decay': hyp['weight_decay']
     #         })
 
@@ -591,7 +594,7 @@ def train(hyp, opt, device, callbacks):
         callbacks.run("on_train_epoch_start")
         model.train()
         # 更新 compute_loss 的 epoch 信息以支持蒸馏 warmup 调度
-        if hasattr(compute_loss, 'set_epoch'):
+        if hasattr(compute_loss, "set_epoch"):
             try:
                 compute_loss.set_epoch(epoch, epochs)
             except Exception:
@@ -611,7 +614,10 @@ def train(hyp, opt, device, callbacks):
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(("\n" + "%11s" * 8) % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "distill", "Instances", "Size"))
+        LOGGER.info(
+            ("\n" + "%11s" * 8)
+            % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "distill", "Instances", "Size")
+        )
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
@@ -641,7 +647,7 @@ def train(hyp, opt, device, callbacks):
             # 多尺度训练：随机缩放输入（±50%），并保持为 gs 的倍数
 
             # Forward
-            with torch.amp.autocast('cuda', enabled=amp):
+            with torch.amp.autocast("cuda", enabled=amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device), imgs=imgs)  # loss scaled by batch_size
                 # loss_items = (lbox, lobj, lcls, ldistill)
@@ -659,7 +665,7 @@ def train(hyp, opt, device, callbacks):
                 writer.add_scalar("loss/cls", lcls.item(), global_step)
                 writer.add_scalar("loss/distill", (ldistill / batch_size).item(), global_step)
                 writer.add_scalar("loss/total", loss.item(), global_step)
-                
+
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -739,7 +745,7 @@ def train(hyp, opt, device, callbacks):
                     "git": GIT_INFO,  # {remote, branch, commit} if a git repo
                     "date": datetime.now().isoformat(),
                 }
-                
+
                 # TensorBoard: log validation metrics and losses per epoch
                 try:
                     writer.add_scalar("metrics/precision", float(results[0]), epoch)
@@ -815,10 +821,10 @@ def train(hyp, opt, device, callbacks):
         callbacks.run("on_train_end", last, best, epoch, results)
 
     torch.cuda.empty_cache()
-    
+
     # close tensorboard writer
     writer.close()
-    
+
     return results
 
 
@@ -828,7 +834,6 @@ def parse_opt(known=False):
     Args:
         known (bool, optional): If True, parses known arguments, ignoring the unknown. Defaults to False.
 
-        
     Returns:
         (argparse.Namespace): Parsed command-line arguments containing options for YOLOv5 execution.
 
@@ -896,10 +901,10 @@ def parse_opt(known=False):
 
     # Distill opt
     parser.add_argument(
-        "--distill", 
-        type=str, 
+        "--distill",
+        type=str,
         default="",  # 默认空字符串 → 关闭蒸馏
-        help="Enable knowledge distillation (specify teacher model path): --distill yolov5l.pt (empty=disable)"
+        help="Enable knowledge distillation (specify teacher model path): --distill yolov5l.pt (empty=disable)",
     )
     parser.add_argument(
         "--distill_mode",
